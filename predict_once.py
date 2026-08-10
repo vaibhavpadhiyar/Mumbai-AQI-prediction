@@ -38,6 +38,11 @@ SEQ_LEN = 14
 FEATURES = ["PM2.5", "PM10", "NO2", "SO2", "O3", "AQI"]
 TARGET_COL = "AQI"
 
+# WAQI stations don't always report daily - a station whose sensor is down
+# just keeps serving its last known reading. If we don't check the age of
+# that reading, one dead sensor can freeze the whole citywide average.
+MAX_STATION_AGE_HOURS = 30
+
 import requests
 
 
@@ -51,6 +56,19 @@ def _to_valid_number(value):
     return v
 
 
+def _reading_age_hours(iso_timestamp):
+    """How many hours old is this station's last reading, per WAQI's own
+    reported observation time (data.time.iso in the API response)."""
+    if not iso_timestamp:
+        return None
+    try:
+        observed = pd.to_datetime(iso_timestamp, utc=True)
+        now = pd.Timestamp.now(tz="UTC")
+        return (now - observed).total_seconds() / 3600
+    except Exception:
+        return None
+
+
 def fetch_station_reading(uid):
     url = f"https://api.waqi.info/feed/@{uid}/?token={TOKEN}"
     try:
@@ -59,6 +77,17 @@ def fetch_station_reading(uid):
         if data["status"] != "ok":
             print(f"  Station {uid}: API error - {data}")
             return None
+
+        observed_iso = data["data"].get("time", {}).get("iso")
+        age_hours = _reading_age_hours(observed_iso)
+        if age_hours is not None and age_hours > MAX_STATION_AGE_HOURS:
+            print(
+                f"  Station {uid}: last reading is {age_hours:.0f}h old "
+                f"(observed {observed_iso}) - sensor looks offline, skipping "
+                f"so it doesn't drag down the average with stale data."
+            )
+            return None
+
         iaqi = data["data"].get("iaqi", {})
         return {
             "PM2.5": _to_valid_number(iaqi.get("pm25", {}).get("v")),
