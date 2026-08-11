@@ -8,24 +8,33 @@ and exits. GitHub Actions handles "when to run", not this script.
 The WAQI token is read from an environment variable (WAQI_TOKEN) so
 it never needs to be committed to the repo in plain text - set it as
 a GitHub Actions "secret" (see setup instructions).
+
+STATION DISCOVERY:
+Earlier versions of this script hardcoded 5 WAQI station UIDs
+(Kurla, BKC, CSMIA, Sion, Bandra). That's fragile - if any station
+goes permanently offline (as Bandra/8678 did in Dec 2021, and as
+4 more did simultaneously in June 2026), there is no fixed-ID list
+that stays valid forever.
+
+Instead, this version queries WAQI's map/bounds endpoint for
+whatever stations are CURRENTLY reporting inside Mumbai's bounding
+box, and filters to only the ones with a recent timestamp. This
+self-heals if stations die or new ones come online - no code change
+needed on our end.
 """
 
 import os
 import numpy as np
 import pandas as pd
 import joblib
+import requests
 from datetime import datetime
 from tensorflow.keras.models import load_model
 
 TOKEN = os.environ.get("WAQI_TOKEN", "b96baa0045a132d1ea15a9c8b45f0f390bb1d5b6")
 
-STATION_UIDS = {
-    "Kurla": "12454",
-    "Bandra Kurla Complex": "13715",
-    "Chhatrapati Shivaji Intl. Airport": "12456",
-    "Sion": "12464",
-    "Bandra": "8678",
-}
+# Southwest lat,lng , Northeast lat,lng - covers Greater Mumbai
+MUMBAI_BOUNDS = "18.85,72.75,19.35,73.05"
 
 MODEL_PATH = "mumbai_aqi_lstm_model_finetuned_recent.keras"
 SCALER_PATH = "mumbai_aqi_scaler.save"
@@ -37,13 +46,10 @@ HISTORY_FULL_PATH = "history_full.csv"
 SEQ_LEN = 14
 FEATURES = ["PM2.5", "PM10", "NO2", "SO2", "O3", "AQI"]
 TARGET_COL = "AQI"
+POLLUTANT_COLS = ["PM2.5", "PM10", "NO2", "SO2", "O3"]
 
-# WAQI stations don't always report daily - a station whose sensor is down
-# just keeps serving its last known reading. If we don't check the age of
-# that reading, one dead sensor can freeze the whole citywide average.
-MAX_STATION_AGE_HOURS = 30
-
-import requests
+MAX_STALE_HOURS = 6          # a station is "offline" if its last reading is older than this
+MIN_LIVE_STATIONS = 2        # don't trust the average if fewer than this many stations are live
 
 
 def _to_valid_number(value):
@@ -56,20 +62,58 @@ def _to_valid_number(value):
     return v
 
 
-def _reading_age_hours(iso_timestamp):
-    """How many hours old is this station's last reading, per WAQI's own
-    reported observation time (data.time.iso in the API response)."""
-    if not iso_timestamp:
-        return None
+def discover_live_stations():
+    """Query WAQI's map/bounds endpoint for every station currently
+    reporting inside Mumbai's bounding box, and keep only the ones whose
+    last observation is fresh. Returns a list of {"uid", "name", "age_hours"}.
+    """
+    url = f"https://api.waqi.info/map/bounds/?latlng={MUMBAI_BOUNDS}&token={TOKEN}"
     try:
-        observed = pd.to_datetime(iso_timestamp, utc=True)
-        now = pd.Timestamp.now(tz="UTC")
-        return (now - observed).total_seconds() / 3600
-    except Exception:
-        return None
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        if data.get("status") != "ok":
+            print(f"  Station discovery failed: {data}")
+            return []
+    except Exception as e:
+        print(f"  Station discovery failed: {e}")
+        return []
+
+    live_stations = []
+    for entry in data.get("data", []):
+        aqi_val = entry.get("aqi")
+        if aqi_val in (None, "-", "999"):
+            continue  # WAQI's own "no data" placeholder for this station
+
+        station_info = entry.get("station", {}) or {}
+        time_str = station_info.get("time")
+        if not time_str:
+            continue
+        try:
+            obs_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+
+        age_hours = (datetime.now() - obs_time).total_seconds() / 3600
+        if age_hours > MAX_STALE_HOURS:
+            print(
+                f"  Discovered station {entry.get('uid')} ({station_info.get('name', '?')}): "
+                f"{age_hours:.0f}h old - too stale, skipping."
+            )
+            continue
+
+        live_stations.append({
+            "uid": entry["uid"],
+            "name": station_info.get("name", f"uid-{entry['uid']}"),
+            "age_hours": age_hours,
+        })
+
+    return live_stations
 
 
 def fetch_station_reading(uid):
+    """Fetch pollutant breakdown for one station. A second, independent
+    freshness check happens here too (defense in depth) in case the
+    bounds endpoint's timestamp and the feed endpoint's timestamp disagree."""
     url = f"https://api.waqi.info/feed/@{uid}/?token={TOKEN}"
     try:
         resp = requests.get(url, timeout=10)
@@ -78,14 +122,20 @@ def fetch_station_reading(uid):
             print(f"  Station {uid}: API error - {data}")
             return None
 
-        observed_iso = data["data"].get("time", {}).get("iso")
-        age_hours = _reading_age_hours(observed_iso)
-        if age_hours is not None and age_hours > MAX_STATION_AGE_HOURS:
-            print(
-                f"  Station {uid}: last reading is {age_hours:.0f}h old "
-                f"(observed {observed_iso}) - sensor looks offline, skipping "
-                f"so it doesn't drag down the average with stale data."
-            )
+        obs_time_str = data["data"].get("time", {}).get("iso")
+        if obs_time_str:
+            obs_time = datetime.fromisoformat(obs_time_str)
+            now_utc = datetime.now(obs_time.tzinfo) if obs_time.tzinfo else datetime.now()
+            age_hours = (now_utc - obs_time).total_seconds() / 3600
+            if age_hours > MAX_STALE_HOURS:
+                print(
+                    f"  Station {uid}: last reading is {age_hours:.0f}h old "
+                    f"(observed {obs_time_str}) - sensor looks offline, skipping "
+                    f"so it doesn't drag down the average with stale data."
+                )
+                return None
+        else:
+            print(f"  Station {uid}: no timestamp in response - skipping to be safe.")
             return None
 
         iaqi = data["data"].get("iaqi", {})
@@ -102,29 +152,34 @@ def fetch_station_reading(uid):
         return None
 
 
-POLLUTANT_COLS = ["PM2.5", "PM10", "NO2", "SO2", "O3"]
-
-
 def fetch_today_city_average():
+    print("Discovering live stations near Mumbai...")
+    candidates = discover_live_stations()
+    if len(candidates) < MIN_LIVE_STATIONS:
+        print(
+            f"  Only {len(candidates)} live station(s) found near Mumbai "
+            f"(need at least {MIN_LIVE_STATIONS}) - not enough to trust an average today."
+        )
+        return None
+
+    print(f"  Found {len(candidates)} live stations: "
+          + ", ".join(f"{c['name']} ({c['age_hours']:.1f}h old)" for c in candidates))
+
     readings, station_rows = [], []
-    for name, uid in STATION_UIDS.items():
-        r = fetch_station_reading(uid)
+    for c in candidates:
+        r = fetch_station_reading(c["uid"])
         if r is not None:
             readings.append(r)
-            station_rows.append({"station": name, **r})
-            print(f"  {name}: {r}")
+            station_rows.append({"station": c["name"], "uid": c["uid"], **r})
+            print(f"  {c['name']}: {r}")
 
-            # WAQI's per-station "aqi" field is sometimes wrong/stale relative
-            # to that same station's own pollutant readings (e.g. reporting a
-            # low AQI alongside a very high PM2.5). Flag it loudly so it shows
-            # up in the Action logs instead of silently poisoning the average.
             station_aqi = r.get("AQI")
             pollutant_vals = [r[p] for p in POLLUTANT_COLS if r.get(p) is not None]
             if station_aqi is not None and pollutant_vals:
                 implied_aqi = max(pollutant_vals)
                 if implied_aqi - station_aqi > 100:
                     print(
-                        f"    Warning: {name} reports AQI={station_aqi} but its own "
+                        f"    Warning: {c['name']} reports AQI={station_aqi} but its own "
                         f"pollutant readings imply ~{implied_aqi:.0f} - likely a bad "
                         f"reading from this station, treating with suspicion."
                     )
@@ -132,8 +187,8 @@ def fetch_today_city_average():
     if station_rows:
         pd.DataFrame(station_rows).to_csv(STATIONS_LOG_PATH, index=False)
 
-    if not readings:
-        print("  No stations returned data today.")
+    if len(readings) < MIN_LIVE_STATIONS:
+        print(f"  Only {len(readings)} station(s) returned usable data - skipping today.")
         return None
 
     df = pd.DataFrame(readings)
@@ -142,12 +197,6 @@ def fetch_today_city_average():
 
     avg = df[FEATURES].mean(skipna=True)
 
-    # Recompute the citywide AQI from the averaged pollutant sub-indices
-    # (standard AQI methodology: overall AQI = max of the individual
-    # pollutant sub-indices) rather than averaging each station's own
-    # reported AQI field. Averaging reported AQIs lets one bad station
-    # (e.g. a low AQI reported alongside a very high PM2.5) drag the whole
-    # city's number down to something inconsistent with the pollutant data.
     pollutant_avgs = avg[POLLUTANT_COLS].dropna()
     if not pollutant_avgs.empty:
         derived_aqi = pollutant_avgs.max()
@@ -166,9 +215,6 @@ def fetch_today_city_average():
 
 
 def check_for_stale_data(today_values: "pd.Series", buffer: pd.DataFrame) -> None:
-    """Warn (but don't block) if today's fetch is suspiciously identical to
-    recent buffer entries - a strong sign the WAQI API served cached/stale
-    data instead of a fresh reading (e.g. an expired WAQI_TOKEN)."""
     if buffer.empty:
         return
     recent = buffer.tail(3)
@@ -190,12 +236,6 @@ def check_for_stale_data(today_values: "pd.Series", buffer: pd.DataFrame) -> Non
 
 
 def update_full_history(today: pd.Timestamp, today_values: "pd.Series") -> None:
-    """Append today's reading to a second, never-trimmed log (history_full.csv).
-
-    buffer.csv is intentionally kept short (SEQ_LEN * 3 days) since that's all
-    the model needs as input. But a website showing 6-month/1-year AQI trends
-    needs the full history, so this keeps a separate, ever-growing file with
-    the same columns instead of trimming it."""
     try:
         history_full = pd.read_csv(HISTORY_FULL_PATH, parse_dates=["Date"])
     except FileNotFoundError:
