@@ -83,23 +83,40 @@ def discover_live_stations():
         print(f"  Station discovery failed: {e}")
         return []
 
+    entries = data.get("data", [])
+    print(f"  Discovery: WAQI returned {len(entries)} station(s) inside the Mumbai bounding box.")
+
+    # Counters so a bad run tells us WHY it found nothing, instead of just
+    # silently returning an empty list (that silence is exactly what made
+    # the previous parsing bug invisible - it never printed anything).
+    skipped_no_data, skipped_no_time, skipped_bad_time, skipped_stale = 0, 0, 0, 0
+
     live_stations = []
-    for entry in data.get("data", []):
+    for entry in entries:
         aqi_val = entry.get("aqi")
         if aqi_val in (None, "-", "999"):
+            skipped_no_data += 1
             continue  # WAQI's own "no data" placeholder for this station
 
         station_info = entry.get("station", {}) or {}
         time_str = station_info.get("time")
         if not time_str:
-            continue
-        try:
-            obs_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
+            skipped_no_time += 1
             continue
 
-        age_hours = (datetime.now() - obs_time).total_seconds() / 3600
+        # WAQI's map/bounds endpoint returns ISO 8601 with a timezone offset
+        # (e.g. "2026-08-11T09:00:00+05:30"), NOT "YYYY-MM-DD HH:MM:SS".
+        # Use pandas' flexible parser instead of a single strptime format so
+        # this doesn't silently break again if WAQI tweaks the format.
+        obs_time = pd.to_datetime(time_str, errors="coerce", utc=True)
+        if pd.isna(obs_time):
+            skipped_bad_time += 1
+            print(f"    Could not parse timestamp '{time_str}' for uid {entry.get('uid')} - skipping.")
+            continue
+
+        age_hours = (pd.Timestamp.now(tz="UTC") - obs_time).total_seconds() / 3600
         if age_hours > MAX_STALE_HOURS:
+            skipped_stale += 1
             print(
                 f"  Discovered station {entry.get('uid')} ({station_info.get('name', '?')}): "
                 f"{age_hours:.0f}h old - too stale, skipping."
@@ -112,6 +129,11 @@ def discover_live_stations():
             "age_hours": age_hours,
         })
 
+    print(
+        f"  Discovery breakdown: {skipped_no_data} no-data, {skipped_no_time} no-timestamp, "
+        f"{skipped_bad_time} unparseable-timestamp, {skipped_stale} stale, "
+        f"{len(live_stations)} usable."
+    )
     return live_stations
 
 
