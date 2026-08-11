@@ -50,6 +50,11 @@ POLLUTANT_COLS = ["PM2.5", "PM10", "NO2", "SO2", "O3"]
 
 MAX_STALE_HOURS = 6          # a station is "offline" if its last reading is older than this
 MIN_LIVE_STATIONS = 2        # don't trust the average if fewer than this many stations are live
+MAX_AQI_MISMATCH = 100        # if a station's own AQI vs its pollutant-implied AQI differ by
+                               # more than this, the station's own AQI value is corrupted -
+                               # drop it and derive that station's AQI from pollutants instead
+MAX_PLAUSIBLE_SUBINDEX = 500  # WAQI sub-indices top out at 500 (hazardous ceiling) - anything
+                               # above that is a bad reading, not real air quality
 
 
 def _to_valid_number(value):
@@ -139,7 +144,7 @@ def fetch_station_reading(uid):
             return None
 
         iaqi = data["data"].get("iaqi", {})
-        return {
+        reading = {
             "PM2.5": _to_valid_number(iaqi.get("pm25", {}).get("v")),
             "PM10": _to_valid_number(iaqi.get("pm10", {}).get("v")),
             "NO2": _to_valid_number(iaqi.get("no2", {}).get("v")),
@@ -147,6 +152,19 @@ def fetch_station_reading(uid):
             "O3": _to_valid_number(iaqi.get("o3", {}).get("v")),
             "AQI": _to_valid_number(data["data"].get("aqi")),
         }
+
+        # Discard individual pollutant sub-indices outside the plausible WAQI
+        # range (0-500). Real example that motivated this: a "live" station
+        # reporting PM2.5=837 with no PM10 and no AQI at all - not staleness,
+        # just a bad reading, and it would otherwise still poison the average.
+        for p in POLLUTANT_COLS:
+            v = reading.get(p)
+            if v is not None and (v < 0 or v > MAX_PLAUSIBLE_SUBINDEX):
+                print(f"    Station {uid}: {p}={v} is outside the plausible 0-{MAX_PLAUSIBLE_SUBINDEX} "
+                      f"range - discarding that value (bad reading, not a real level).")
+                reading[p] = None
+
+        return reading
     except Exception as e:
         print(f"  Station {uid}: fetch failed - {e}")
         return None
@@ -177,12 +195,17 @@ def fetch_today_city_average():
             pollutant_vals = [r[p] for p in POLLUTANT_COLS if r.get(p) is not None]
             if station_aqi is not None and pollutant_vals:
                 implied_aqi = max(pollutant_vals)
-                if implied_aqi - station_aqi > 100:
+                if abs(implied_aqi - station_aqi) > MAX_AQI_MISMATCH:
                     print(
                         f"    Warning: {c['name']} reports AQI={station_aqi} but its own "
-                        f"pollutant readings imply ~{implied_aqi:.0f} - likely a bad "
-                        f"reading from this station, treating with suspicion."
+                        f"pollutant readings imply ~{implied_aqi:.0f} - this station's AQI "
+                        f"field is corrupted, discarding it (its pollutant readings are "
+                        f"still used)."
                     )
+                    # Drop only the bad AQI field, not the whole station - the
+                    # pollutant sub-indices (PM2.5, PM10, etc.) are what actually
+                    # drive the derived citywide AQI below, so they're still useful.
+                    r["AQI"] = None
 
     if station_rows:
         pd.DataFrame(station_rows).to_csv(STATIONS_LOG_PATH, index=False)
