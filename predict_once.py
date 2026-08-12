@@ -8,24 +8,47 @@ and exits. GitHub Actions handles "when to run", not this script.
 The WAQI token is read from an environment variable (WAQI_TOKEN) so
 it never needs to be committed to the repo in plain text - set it as
 a GitHub Actions "secret" (see setup instructions).
+
+STATION DISCOVERY:
+Earlier versions hardcoded 5 WAQI station UIDs (Kurla, BKC, CSMIA, Sion,
+Bandra). That's fragile - if a station goes permanently offline (as
+Bandra/8678 did in Dec 2021, and as 4 more did simultaneously in June
+2026), a fixed-ID list never recovers.
+
+This version samples several points spread across Mumbai using WAQI's
+/feed/geo:LAT;LON/ endpoint (the same endpoint style as the original
+@uid version, just with coordinates instead of a hardcoded ID). WAQI
+resolves each point to whichever real station is currently nearest and
+reporting, so this self-heals if stations die or new ones appear - no
+code change needed on our end. (An earlier attempt used /map/bounds/
+instead, but that endpoint returned 0 stations for this token/bbox in
+testing, so /feed/ - already proven reliable - is used instead.)
 """
 
 import os
 import numpy as np
 import pandas as pd
 import joblib
-from datetime import datetime
+import requests
 from tensorflow.keras.models import load_model
 
 TOKEN = os.environ.get("WAQI_TOKEN", "b96baa0045a132d1ea15a9c8b45f0f390bb1d5b6")
 
-STATION_UIDS = {
-    "Kurla": "12454",
-    "Bandra Kurla Complex": "13715",
-    "Chhatrapati Shivaji Intl. Airport": "12456",
-    "Sion": "12464",
-    "Bandra": "8678",
-}
+# Points spread across Greater Mumbai. Each is used with WAQI's
+# /feed/geo:LAT;LON/ endpoint, which resolves to whichever real station is
+# nearest and currently reporting - so this list doesn't need to match real
+# station locations exactly, it just needs decent geographic spread so we
+# sample different parts of the city instead of repeatedly hitting one area.
+CITY_SAMPLE_POINTS = [
+    ("South Mumbai", 18.9220, 72.8347),
+    ("Bandra", 19.0596, 72.8295),
+    ("Kurla/BKC", 19.0728, 72.8826),
+    ("Andheri", 19.1197, 72.8468),
+    ("Powai", 19.1176, 72.9060),
+    ("Borivali", 19.2307, 72.8567),
+    ("Chembur", 19.0522, 72.9005),
+    ("Navi Mumbai", 19.0330, 73.0297),
+]
 
 MODEL_PATH = "mumbai_aqi_lstm_model_finetuned_recent.keras"
 SCALER_PATH = "mumbai_aqi_scaler.save"
@@ -37,18 +60,15 @@ HISTORY_FULL_PATH = "history_full.csv"
 SEQ_LEN = 14
 FEATURES = ["PM2.5", "PM10", "NO2", "SO2", "O3", "AQI"]
 TARGET_COL = "AQI"
+POLLUTANT_COLS = ["PM2.5", "PM10", "NO2", "SO2", "O3"]
 
-# WAQI stations don't always report daily - a station whose sensor is down
-# just keeps serving its last known reading. If we don't check the age of
-# that reading, one dead sensor can freeze the whole citywide average.
-MAX_STATION_AGE_HOURS = 30
-
-# Mumbai's coordinates - used to ask WAQI for whichever station is
-# currently live nearest this point, instead of relying on fixed station
-# IDs that can go permanently offline (as all 5 of the original ones did).
-MUMBAI_LAT, MUMBAI_LON = 19.0760, 72.8777
-
-import requests
+MAX_STALE_HOURS = 6          # a station is "offline" if its last reading is older than this
+MIN_LIVE_STATIONS = 2        # don't trust the average if fewer than this many stations are live
+MAX_AQI_MISMATCH = 100        # if a station's own AQI vs its pollutant-implied AQI differ by
+                               # more than this, the station's own AQI value is corrupted -
+                               # drop it and derive that station's AQI from pollutants instead
+MAX_PLAUSIBLE_SUBINDEX = 500  # WAQI sub-indices top out at 500 (hazardous ceiling) - anything
+                               # above that is a bad reading, not real air quality
 
 
 def _to_valid_number(value):
@@ -61,126 +81,134 @@ def _to_valid_number(value):
     return v
 
 
-def _reading_age_hours(iso_timestamp):
-    """How many hours old is this station's last reading, per WAQI's own
-    reported observation time (data.time.iso in the API response)."""
-    if not iso_timestamp:
-        return None
-    try:
-        observed = pd.to_datetime(iso_timestamp, utc=True)
-        now = pd.Timestamp.now(tz="UTC")
-        return (now - observed).total_seconds() / 3600
-    except Exception:
-        return None
+def discover_live_stations():
+    """Find live Mumbai stations by sampling several points spread across the
+    city with WAQI's /feed/geo:LAT;LON/ endpoint - the SAME endpoint style as
+    the original fixed-UID version (/feed/@UID/), just with coordinates
+    instead of a hardcoded ID. WAQI resolves each point to whichever real
+    station is currently nearest and reporting; duplicates are merged.
+
+    This replaces an earlier attempt using /map/bounds/, which returned 0
+    stations for this token/bbox in testing (likely a plan restriction) -
+    /feed/ is the endpoint already proven to work reliably with this token.
+    Returns a list of {"uid", "name", "reading"} dicts.
+    """
+    found = {}
+    for label, lat, lon in CITY_SAMPLE_POINTS:
+        url = f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={TOKEN}"
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+        except Exception as e:
+            print(f"  {label}: fetch failed - {e}")
+            continue
+
+        parsed = _parse_feed_response(data, label)
+        if parsed is None:
+            continue
+        uid, name, reading = parsed
+        if uid in found:
+            continue  # two sample points resolved to the same nearest station
+        found[uid] = {"uid": uid, "name": name, "reading": reading}
+        print(f"  {label} -> nearest live station: {name} (uid {uid})")
+
+    print(f"  Discovery: sampled {len(CITY_SAMPLE_POINTS)} points across Mumbai, "
+          f"found {len(found)} distinct live station(s).")
+    return list(found.values())
 
 
 def _parse_feed_response(data, source_label):
-    """Shared parsing logic for any WAQI feed response (geo, city name, or
-    a specific station UID) - checks freshness and extracts pollutants."""
+    """Shared parsing + validation for a single WAQI /feed/ response
+    (works whether the URL used @uid or geo:lat;lon). Returns
+    (uid, name, reading_dict) if the reading is fresh and usable, else None."""
     if data.get("status") != "ok":
         print(f"  {source_label}: API error - {data}")
         return None
 
-    observed_iso = data["data"].get("time", {}).get("iso")
-    age_hours = _reading_age_hours(observed_iso)
-    station_name = data["data"].get("city", {}).get("name", source_label)
+    obs_time_str = data["data"].get("time", {}).get("iso")
+    if not obs_time_str:
+        print(f"  {source_label}: no timestamp in response - skipping to be safe.")
+        return None
 
-    if age_hours is not None and age_hours > MAX_STATION_AGE_HOURS:
+    obs_time = pd.to_datetime(obs_time_str, errors="coerce", utc=True)
+    if pd.isna(obs_time):
+        print(f"  {source_label}: unparseable timestamp '{obs_time_str}' - skipping.")
+        return None
+
+    age_hours = (pd.Timestamp.now(tz="UTC") - obs_time).total_seconds() / 3600
+    if age_hours > MAX_STALE_HOURS:
         print(
-            f"  {source_label} ({station_name}): last reading is {age_hours:.0f}h old "
-            f"(observed {observed_iso}) - sensor looks offline, skipping."
+            f"  {source_label}: last reading is {age_hours:.0f}h old "
+            f"(observed {obs_time_str}) - sensor looks offline, skipping "
+            f"so it doesn't drag down the average with stale data."
         )
         return None
 
+    uid = data["data"].get("idx")
+    name = data["data"].get("city", {}).get("name", f"station-{uid}")
+
     iaqi = data["data"].get("iaqi", {})
-    print(f"  {source_label} resolved to station: {station_name} (reading age: "
-          f"{age_hours:.1f}h)" if age_hours is not None else f"  {source_label} resolved to: {station_name}")
-    return {
+    reading = {
         "PM2.5": _to_valid_number(iaqi.get("pm25", {}).get("v")),
         "PM10": _to_valid_number(iaqi.get("pm10", {}).get("v")),
         "NO2": _to_valid_number(iaqi.get("no2", {}).get("v")),
         "SO2": _to_valid_number(iaqi.get("so2", {}).get("v")),
         "O3": _to_valid_number(iaqi.get("o3", {}).get("v")),
         "AQI": _to_valid_number(data["data"].get("aqi")),
-        "_station_name": station_name,
     }
 
+    # Discard individual pollutant sub-indices outside the plausible WAQI
+    # range (0-500). Real example that motivated this: a "live" station
+    # reporting PM2.5=837 with no PM10 and no AQI at all - not staleness,
+    # just a bad reading, and it would otherwise still poison the average.
+    for p in POLLUTANT_COLS:
+        v = reading.get(p)
+        if v is not None and (v < 0 or v > MAX_PLAUSIBLE_SUBINDEX):
+            print(f"    {name}: {p}={v} is outside the plausible 0-{MAX_PLAUSIBLE_SUBINDEX} "
+                  f"range - discarding that value (bad reading, not a real level).")
+            reading[p] = None
 
-def fetch_geo_feed():
-    """Ask WAQI for whichever station is currently live nearest Mumbai's
-    coordinates - this is the preferred source since it doesn't depend on
-    any specific station staying online."""
-    url = f"https://api.waqi.info/feed/geo:{MUMBAI_LAT};{MUMBAI_LON}/?token={TOKEN}"
-    try:
-        resp = requests.get(url, timeout=10)
-        return _parse_feed_response(resp.json(), "Geo feed")
-    except Exception as e:
-        print(f"  Geo feed: fetch failed - {e}")
-        return None
-
-
-def fetch_station_reading(uid):
-    url = f"https://api.waqi.info/feed/@{uid}/?token={TOKEN}"
-    try:
-        resp = requests.get(url, timeout=10)
-        return _parse_feed_response(resp.json(), f"Station {uid}")
-    except Exception as e:
-        print(f"  Station {uid}: fetch failed - {e}")
-        return None
-
-
-POLLUTANT_COLS = ["PM2.5", "PM10", "NO2", "SO2", "O3"]
+    return uid, name, reading
 
 
 def fetch_today_city_average():
-    # Preferred path: ask WAQI for whichever station is live near Mumbai
-    # right now, instead of trusting fixed IDs that can (and did) go dead.
-    print("Trying geo-based feed (auto-picks a live nearby station)...")
-    geo_reading = fetch_geo_feed()
-    if geo_reading is not None:
-        station_rows = [{"station": geo_reading.get("_station_name", "Geo feed"),
-                          **{k: v for k, v in geo_reading.items() if k != "_station_name"}}]
-        pd.DataFrame(station_rows).to_csv(STATIONS_LOG_PATH, index=False)
+    print("Discovering live stations near Mumbai (sampling multiple points across the city)...")
+    candidates = discover_live_stations()
+    if len(candidates) < MIN_LIVE_STATIONS:
+        print(
+            f"  Only {len(candidates)} live station(s) found near Mumbai "
+            f"(need at least {MIN_LIVE_STATIONS}) - not enough to trust an average today."
+        )
+        return None
 
-        avg = pd.Series({col: geo_reading.get(col) for col in FEATURES}, dtype="float64")
-        pollutant_avgs = avg[POLLUTANT_COLS].dropna()
-        if not pollutant_avgs.empty:
-            avg["AQI"] = pollutant_avgs.max()
-        return avg
-
-    # Fallback: the original fixed 5-station average. Kept in case the geo
-    # feed itself has an outage - but as of this writing, all 5 of these
-    # specific station IDs have been offline for weeks, so don't expect
-    # this branch to produce anything useful until they come back (if ever).
-    print("Geo feed unavailable - falling back to fixed station list...")
     readings, station_rows = [], []
-    for name, uid in STATION_UIDS.items():
-        r = fetch_station_reading(uid)
-        if r is not None:
-            readings.append(r)
-            station_rows.append({"station": name, **{k: v for k, v in r.items() if k != "_station_name"}})
-            print(f"  {name}: {r}")
+    for c in candidates:
+        r = c["reading"]
+        readings.append(r)
+        station_rows.append({"station": c["name"], "uid": c["uid"], **r})
+        print(f"  {c['name']}: {r}")
 
-            # WAQI's per-station "aqi" field is sometimes wrong/stale relative
-            # to that same station's own pollutant readings (e.g. reporting a
-            # low AQI alongside a very high PM2.5). Flag it loudly so it shows
-            # up in the Action logs instead of silently poisoning the average.
-            station_aqi = r.get("AQI")
-            pollutant_vals = [r[p] for p in POLLUTANT_COLS if r.get(p) is not None]
-            if station_aqi is not None and pollutant_vals:
-                implied_aqi = max(pollutant_vals)
-                if implied_aqi - station_aqi > 100:
-                    print(
-                        f"    Warning: {name} reports AQI={station_aqi} but its own "
-                        f"pollutant readings imply ~{implied_aqi:.0f} - likely a bad "
-                        f"reading from this station, treating with suspicion."
-                    )
+        station_aqi = r.get("AQI")
+        pollutant_vals = [r[p] for p in POLLUTANT_COLS if r.get(p) is not None]
+        if station_aqi is not None and pollutant_vals:
+            implied_aqi = max(pollutant_vals)
+            if abs(implied_aqi - station_aqi) > MAX_AQI_MISMATCH:
+                print(
+                    f"    Warning: {c['name']} reports AQI={station_aqi} but its own "
+                    f"pollutant readings imply ~{implied_aqi:.0f} - this station's AQI "
+                    f"field is corrupted, discarding it (its pollutant readings are "
+                    f"still used)."
+                )
+                # Drop only the bad AQI field, not the whole station - the
+                # pollutant sub-indices (PM2.5, PM10, etc.) are what actually
+                # drive the derived citywide AQI below, so they're still useful.
+                r["AQI"] = None
 
     if station_rows:
         pd.DataFrame(station_rows).to_csv(STATIONS_LOG_PATH, index=False)
 
-    if not readings:
-        print("  No stations returned data today (geo feed and all fixed stations failed).")
+    if len(readings) < MIN_LIVE_STATIONS:
+        print(f"  Only {len(readings)} station(s) returned usable data - skipping today.")
         return None
 
     df = pd.DataFrame(readings)
@@ -189,12 +217,6 @@ def fetch_today_city_average():
 
     avg = df[FEATURES].mean(skipna=True)
 
-    # Recompute the citywide AQI from the averaged pollutant sub-indices
-    # (standard AQI methodology: overall AQI = max of the individual
-    # pollutant sub-indices) rather than averaging each station's own
-    # reported AQI field. Averaging reported AQIs lets one bad station
-    # (e.g. a low AQI reported alongside a very high PM2.5) drag the whole
-    # city's number down to something inconsistent with the pollutant data.
     pollutant_avgs = avg[POLLUTANT_COLS].dropna()
     if not pollutant_avgs.empty:
         derived_aqi = pollutant_avgs.max()
@@ -213,9 +235,6 @@ def fetch_today_city_average():
 
 
 def check_for_stale_data(today_values: "pd.Series", buffer: pd.DataFrame) -> None:
-    """Warn (but don't block) if today's fetch is suspiciously identical to
-    recent buffer entries - a strong sign the WAQI API served cached/stale
-    data instead of a fresh reading (e.g. an expired WAQI_TOKEN)."""
     if buffer.empty:
         return
     recent = buffer.tail(3)
@@ -237,12 +256,6 @@ def check_for_stale_data(today_values: "pd.Series", buffer: pd.DataFrame) -> Non
 
 
 def update_full_history(today: pd.Timestamp, today_values: "pd.Series") -> None:
-    """Append today's reading to a second, never-trimmed log (history_full.csv).
-
-    buffer.csv is intentionally kept short (SEQ_LEN * 3 days) since that's all
-    the model needs as input. But a website showing 6-month/1-year AQI trends
-    needs the full history, so this keeps a separate, ever-growing file with
-    the same columns instead of trimming it."""
     try:
         history_full = pd.read_csv(HISTORY_FULL_PATH, parse_dates=["Date"])
     except FileNotFoundError:
