@@ -15,16 +15,38 @@ Bandra). That's fragile - if a station goes permanently offline (as
 Bandra/8678 did in Dec 2021, and as 4 more did simultaneously in June
 2026), a fixed-ID list never recovers.
 
+MULTI-SOURCE FALLBACK (Aug 2026):
+WAQI's Mumbai data feed itself went dark for ~50 days (every station,
+same last-reading timestamp - confirmed via discovery logs, not our bug).
+Rather than depend on one upstream source, this version tries THREE
+independent sources in order and uses the first that returns usable data:
+
+  1. WAQI (keyword search, see below) - kept first in case it recovers.
+  2. OpenWeatherMap Air Pollution API - coordinate-based modeled reading,
+     not tied to any single physical sensor that can individually die.
+     Requires OWM_API_KEY (free tier, instant signup).
+  3. CPCB via data.gov.in - India's own official real-time monitoring
+     network, the same one WAQI itself is supposed to ingest from.
+     Requires CPCB_API_KEY (free, data.gov.in registration).
+
+Only if ALL THREE come back empty does the script fall back to reusing
+the model's last known-good window (see main()), clearly flagged as
+"stale_fallback" rather than presented as live.
+
+WAQI STATION DISCOVERY:
+Earlier versions hardcoded 5 WAQI station UIDs (Kurla, BKC, CSMIA, Sion,
+Bandra). That's fragile - if a station goes permanently offline (as
+Bandra/8678 did in Dec 2021, and as 4 more did simultaneously in June
+2026), a fixed-ID list never recovers.
+
 This version searches WAQI's /search/?keyword=Mumbai endpoint to find
 station names matching "Mumbai" directly - a text match, not a geographic
 one - then fetches each match's own /feed/@uid/ for pollutant data and a
-freshness check. This self-heals if stations die or new ones appear.
-(Two earlier attempts used /map/bounds/ and /feed/geo:lat;lon/ - both
-location-based endpoints - and both returned unusable results for this
-token: /map/bounds/ returned 0 stations, and /feed/geo:/ returned the
-same unrelated Delhi station regardless of the Mumbai coordinates given.
-Keyword search is a different code path and doesn't depend on either
-endpoint working correctly.)
+freshness check. (Two earlier attempts used /map/bounds/ and
+/feed/geo:lat;lon/ - both location-based endpoints - and both returned
+unusable results for this token: /map/bounds/ returned 0 stations, and
+/feed/geo:/ returned the same unrelated Delhi station regardless of the
+Mumbai coordinates given.)
 """
 
 import os
@@ -36,11 +58,18 @@ from datetime import datetime
 from tensorflow.keras.models import load_model
 
 TOKEN = os.environ.get("WAQI_TOKEN", "b96baa0045a132d1ea15a9c8b45f0f390bb1d5b6")
+OWM_API_KEY = os.environ.get("OWM_API_KEY", "d5a6daf3c5b2019f84d1b5c29410cfff")
+CPCB_API_KEY = os.environ.get("CPCB_API_KEY", "579b464db66ec23bdd000001fca7b966877041b64eb07cfad46ab07c")
 
 # Keywords used against WAQI's /search/ endpoint to find Mumbai station
 # names. Includes the old British spelling too, in case some station is
 # still labeled that way in WAQI's database.
 SEARCH_KEYWORDS = ["Mumbai", "Bombay"]
+
+MUMBAI_CENTER = (19.0760, 72.8777)
+
+# "Real Time Air Quality Index From CPCB" dataset on data.gov.in.
+CPCB_RESOURCE_ID = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
 
 MODEL_PATH = "mumbai_aqi_lstm_model_finetuned_recent.keras"
 SCALER_PATH = "mumbai_aqi_scaler.save"
@@ -71,6 +100,72 @@ def _to_valid_number(value):
     if v == 999:
         return None
     return v
+
+
+# --- EPA AQI sub-index conversion (used for OpenWeatherMap and, if needed,
+# any other source that gives raw µg/m3 concentrations instead of a
+# pre-computed 0-500 index like WAQI's iaqi). Standard US EPA breakpoint
+# tables, PM2.5 using the 2024 revision. ---
+
+def _linear_aqi(conc, breakpoints):
+    """breakpoints: list of (bp_lo, bp_hi, aqi_lo, aqi_hi) tuples, ascending."""
+    if conc is None or conc < 0:
+        return None
+    for bp_lo, bp_hi, aqi_lo, aqi_hi in breakpoints:
+        if bp_lo <= conc <= bp_hi:
+            return round((aqi_hi - aqi_lo) / (bp_hi - bp_lo) * (conc - bp_lo) + aqi_lo, 1)
+    last_hi = breakpoints[-1][1]
+    return 500.0 if conc > last_hi else 0.0
+
+
+PM25_BREAKPOINTS = [  # micrograms/m3, 24-hr avg
+    (0.0, 9.0, 0, 50), (9.1, 35.4, 51, 100), (35.5, 55.4, 101, 150),
+    (55.5, 125.4, 151, 200), (125.5, 225.4, 201, 300), (225.5, 325.4, 301, 500),
+]
+PM10_BREAKPOINTS = [  # micrograms/m3, 24-hr avg
+    (0, 54, 0, 50), (55, 154, 51, 100), (155, 254, 101, 150),
+    (255, 354, 151, 200), (355, 424, 201, 300), (425, 604, 301, 500),
+]
+# EPA defines NO2/SO2/O3 breakpoints in ppb; OWM/CPCB give micrograms/m3,
+# so convert using each gas's molar mass first.
+NO2_BREAKPOINTS_PPB = [
+    (0, 53, 0, 50), (54, 100, 51, 100), (101, 360, 101, 150),
+    (361, 649, 151, 200), (650, 1249, 201, 300), (1250, 2049, 301, 500),
+]
+SO2_BREAKPOINTS_PPB = [
+    (0, 35, 0, 50), (36, 75, 51, 100), (76, 185, 101, 150),
+    (186, 304, 151, 200), (305, 604, 201, 300), (605, 1004, 301, 500),
+]
+O3_BREAKPOINTS_PPB = [  # 8-hr table (EPA also has a separate 1-hr table above 200, omitted for simplicity)
+    (0, 54, 0, 50), (55, 70, 51, 100), (71, 85, 101, 150),
+    (86, 105, 151, 200), (106, 200, 201, 300),
+]
+
+
+def _ugm3_to_ppb(ugm3, molecular_weight):
+    if ugm3 is None:
+        return None
+    return ugm3 * 24.45 / molecular_weight
+
+
+def pm25_to_aqi(v):
+    return _linear_aqi(v, PM25_BREAKPOINTS)
+
+
+def pm10_to_aqi(v):
+    return _linear_aqi(v, PM10_BREAKPOINTS)
+
+
+def no2_to_aqi(v_ugm3):
+    return _linear_aqi(_ugm3_to_ppb(v_ugm3, 46.0055), NO2_BREAKPOINTS_PPB)
+
+
+def so2_to_aqi(v_ugm3):
+    return _linear_aqi(_ugm3_to_ppb(v_ugm3, 64.066), SO2_BREAKPOINTS_PPB)
+
+
+def o3_to_aqi(v_ugm3):
+    return _linear_aqi(_ugm3_to_ppb(v_ugm3, 48.0), O3_BREAKPOINTS_PPB)
 
 
 def discover_live_stations():
@@ -183,15 +278,163 @@ def _parse_feed_response(data, source_label):
     return uid, name, reading
 
 
+def fetch_openweathermap_reading():
+    """Fallback source #2. OWM's Air Pollution API gives modeled pollutant
+    concentrations for a coordinate rather than readings tied to a specific
+    physical station - so there's no individual sensor that can go offline
+    the way a WAQI/CPCB station can. Raw concentrations (micrograms/m3) are
+    converted to EPA AQI sub-indices to match the scale WAQI's iaqi (and
+    this model) uses. Returns a list with one entry, or [] if unavailable.
+    """
+    if not OWM_API_KEY:
+        print("  OpenWeatherMap: OWM_API_KEY not set - skipping this source.")
+        return []
+
+    lat, lon = MUMBAI_CENTER
+    url = f"https://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OWM_API_KEY}"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        print(f"  OpenWeatherMap: fetch failed - {e}")
+        return []
+
+    entries = data.get("list", [])
+    if not entries:
+        print(f"  OpenWeatherMap: no data returned - {data}")
+        return []
+
+    entry = entries[0]
+    dt = entry.get("dt")
+    if dt is None:
+        print("  OpenWeatherMap: no timestamp in response - skipping to be safe.")
+        return []
+    obs_time = pd.Timestamp(dt, unit="s", tz="UTC")
+    age_hours = (pd.Timestamp.now(tz="UTC") - obs_time).total_seconds() / 3600
+    if age_hours > MAX_STALE_HOURS:
+        print(f"  OpenWeatherMap: last reading is {age_hours:.0f}h old - skipping.")
+        return []
+
+    c = entry.get("components", {})
+    reading = {
+        "PM2.5": pm25_to_aqi(c.get("pm2_5")),
+        "PM10": pm10_to_aqi(c.get("pm10")),
+        "NO2": no2_to_aqi(c.get("no2")),
+        "SO2": so2_to_aqi(c.get("so2")),
+        "O3": o3_to_aqi(c.get("o3")),
+    }
+    pollutant_vals = [v for v in reading.values() if v is not None]
+    reading["AQI"] = max(pollutant_vals) if pollutant_vals else None
+    print(f"  OpenWeatherMap: raw {c} -> converted sub-indices {reading}")
+
+    return [{"uid": "owm-mumbai-center", "name": "OpenWeatherMap (Mumbai, modeled)", "reading": reading}]
+
+
+def fetch_cpcb_readings():
+    """Fallback source #3: India's official CPCB real-time AQI bulletin via
+    data.gov.in - the same government network WAQI is itself supposed to
+    ingest from. NOTE: this dataset's pollutant values are documented as
+    already being on the 0-500 AQI index scale (not raw concentrations),
+    so no breakpoint conversion is applied here - verify this against a
+    real response from your own API key, since this integration hasn't
+    been run against a live key yet.
+    """
+    if not CPCB_API_KEY:
+        print("  CPCB: CPCB_API_KEY not set - skipping this source.")
+        return []
+
+    url = (
+        f"https://api.data.gov.in/resource/{CPCB_RESOURCE_ID}"
+        f"?api-key={CPCB_API_KEY}&format=json&filters[city]=Mumbai&limit=200"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        print(f"  CPCB: fetch failed - {e}")
+        return []
+
+    records = data.get("records", [])
+    if not records:
+        print(f"  CPCB: no records returned for Mumbai - {data.get('message', data)}")
+        return []
+
+    pollutant_key_map = {"PM2.5": "PM2.5", "PM10": "PM10", "NO2": "NO2", "SO2": "SO2", "OZONE": "O3", "O3": "O3"}
+    by_station = {}
+    for rec in records:
+        station = rec.get("station", "Unknown CPCB station")
+        col = pollutant_key_map.get((rec.get("pollutant_id") or "").upper())
+        if col is None:
+            continue
+        try:
+            val = float(rec.get("pollutant_avg"))
+        except (TypeError, ValueError):
+            continue
+
+        entry = by_station.setdefault(station, {
+            "uid": f"cpcb-{station}",
+            "name": f"{station} (CPCB)",
+            "last_update": rec.get("last_update"),
+            "reading": {"PM2.5": None, "PM10": None, "NO2": None, "SO2": None, "O3": None, "AQI": None},
+        })
+        entry["reading"][col] = val
+
+    live = []
+    for station, entry in by_station.items():
+        ts = pd.to_datetime(entry.get("last_update"), errors="coerce")
+        if pd.isna(ts):
+            print(f"  CPCB {station}: no usable timestamp - skipping.")
+            continue
+        ts_utc = ts.tz_localize("Asia/Kolkata").tz_convert("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        age_hours = (pd.Timestamp.now(tz="UTC") - ts_utc).total_seconds() / 3600
+        if age_hours > MAX_STALE_HOURS:
+            print(f"  CPCB {station}: last reading is {age_hours:.0f}h old - skipping.")
+            continue
+
+        r = entry["reading"]
+        pollutant_vals = [v for v in [r["PM2.5"], r["PM10"], r["NO2"], r["SO2"], r["O3"]] if v is not None]
+        r["AQI"] = max(pollutant_vals) if pollutant_vals else None
+        live.append({"uid": entry["uid"], "name": entry["name"], "reading": r})
+
+    print(f"  CPCB: {len(live)} of {len(by_station)} Mumbai station(s) are live and fresh.")
+    return live
+
+
+def discover_live_readings():
+    """Try each live source in order, use the first that returns enough
+    usable data. WAQI and CPCB need >=MIN_LIVE_STATIONS distinct stations
+    (to average out single-sensor noise); OpenWeatherMap's single modeled
+    citywide reading is accepted alone since it isn't a physical sensor
+    that can individually misbehave the same way.
+    Returns (source_name, list of {"uid","name","reading"}).
+    """
+    print("Trying WAQI first...")
+    waqi = discover_live_stations()
+    if len(waqi) >= MIN_LIVE_STATIONS:
+        return "waqi", waqi
+    print(f"  WAQI: only {len(waqi)} usable station(s) - trying OpenWeatherMap next.")
+
+    owm = fetch_openweathermap_reading()
+    if len(owm) >= 1:
+        return "openweathermap", owm
+    print("  OpenWeatherMap: unavailable - trying CPCB next.")
+
+    cpcb = fetch_cpcb_readings()
+    if len(cpcb) >= MIN_LIVE_STATIONS:
+        return "cpcb", cpcb
+    print(f"  CPCB: only {len(cpcb)} usable station(s) either - no live source available today.")
+
+    return "none", []
+
+
 def fetch_today_city_average():
-    print("Discovering live stations near Mumbai (sampling multiple points across the city)...")
-    candidates = discover_live_stations()
-    if len(candidates) < MIN_LIVE_STATIONS:
-        print(
-            f"  Only {len(candidates)} live station(s) found near Mumbai "
-            f"(need at least {MIN_LIVE_STATIONS}) - not enough to trust an average today."
-        )
+    print("Discovering live air quality data for Mumbai (WAQI -> OpenWeatherMap -> CPCB)...")
+    source, candidates = discover_live_readings()
+    if not candidates:
+        print("  No live source returned usable data today.")
         return None
+
+    print(f"  Using source: {source} ({len(candidates)} reading(s))")
 
     readings, station_rows = [], []
     for c in candidates:
@@ -217,10 +460,15 @@ def fetch_today_city_average():
                 r["AQI"] = None
 
     if station_rows:
+        for row in station_rows:
+            row["source"] = source
         pd.DataFrame(station_rows).to_csv(STATIONS_LOG_PATH, index=False)
 
-    if len(readings) < MIN_LIVE_STATIONS:
-        print(f"  Only {len(readings)} station(s) returned usable data - skipping today.")
+    # OpenWeatherMap's single citywide modeled reading is intentionally
+    # allowed to bypass the multi-station minimum (see discover_live_readings).
+    min_needed = 1 if source == "openweathermap" else MIN_LIVE_STATIONS
+    if len(readings) < min_needed:
+        print(f"  Only {len(readings)} reading(s) returned usable data - skipping today.")
         return None
 
     df = pd.DataFrame(readings)
@@ -243,6 +491,7 @@ def fetch_today_city_average():
     missing = avg[avg.isna()].index.tolist()
     if missing:
         print(f"  Warning: no valid reading from ANY station for: {missing}")
+    avg.attrs["source"] = source
     return avg
 
 
@@ -296,9 +545,6 @@ def main():
 
     print("Fetching live station data...")
     today_values = fetch_today_city_average()
-    if today_values is None:
-        print("No data available today - exiting without prediction.")
-        return
 
     try:
         buffer = pd.read_csv(BUFFER_PATH, parse_dates=["Date"])
@@ -306,18 +552,48 @@ def main():
         print(f"No {BUFFER_PATH} found - creating a new one.")
         buffer = pd.DataFrame(columns=["Date"] + FEATURES)
 
-    check_for_stale_data(today_values, buffer)
+    # data_status travels through to the log so the frontend/presentation
+    # can be honest about whether today's number is live or carried forward.
+    data_status = "live"
+    last_live_date = None
 
-    if today in buffer["Date"].values:
-        print("Today's entry already logged - skipping duplicate.")
+    if today_values is None:
+        # WAQI has no fresh Mumbai data today (upstream outage, not a bug on
+        # our end - see discovery logs). Rather than exiting with nothing to
+        # show, fall back to the model's existing SEQ_LEN-day window and
+        # still produce a prediction from it. This does NOT fabricate a new
+        # "today" row in buffer.csv/history_full.csv - it reuses the last
+        # real days as-is, so the historical record stays honest and never
+        # gets padded with repeated fake values.
+        if buffer.empty or len(buffer) < SEQ_LEN:
+            print(
+                "No live data today AND not enough historical buffer to fall "
+                "back on either - exiting without prediction."
+            )
+            return
+        data_status = "stale_fallback"
+        last_live_date = buffer["Date"].max()
+        print(
+            f"  Live station data unavailable today (see discovery log above). "
+            f"Falling back to the existing {SEQ_LEN}-day window - most recent "
+            f"real data is from {last_live_date.date()} - so a prediction can "
+            f"still be produced. This run is flagged 'stale_fallback' in "
+            f"{PREDICTIONS_LOG_PATH}, not silently presented as live."
+        )
     else:
-        new_row = {"Date": today, **today_values.to_dict()}
-        buffer = pd.concat([buffer, pd.DataFrame([new_row])], ignore_index=True)
-        buffer = buffer.sort_values("Date").tail(SEQ_LEN * 3)
-        buffer.to_csv(BUFFER_PATH, index=False)
-        print(f"Buffer updated - now {len(buffer)} days stored.")
+        data_status = f"live_{today_values.attrs.get('source', 'unknown')}"
+        check_for_stale_data(today_values, buffer)
 
-    update_full_history(today, today_values)
+        if today in buffer["Date"].values:
+            print("Today's entry already logged - skipping duplicate.")
+        else:
+            new_row = {"Date": today, **today_values.to_dict()}
+            buffer = pd.concat([buffer, pd.DataFrame([new_row])], ignore_index=True)
+            buffer = buffer.sort_values("Date").tail(SEQ_LEN * 3)
+            buffer.to_csv(BUFFER_PATH, index=False)
+            print(f"Buffer updated - now {len(buffer)} days stored.")
+
+        update_full_history(today, today_values)
 
     if len(buffer) < SEQ_LEN:
         print(f"Not enough history yet ({len(buffer)}/{SEQ_LEN} days).")
@@ -339,13 +615,16 @@ def main():
     dummy[:, target_idx] = pred_scaled
     pred_aqi = scaler.inverse_transform(dummy)[:, target_idx][0]
 
-    print(f"PREDICTED AQI FOR TOMORROW: {pred_aqi:.1f}")
+    status_tag = " [FALLBACK - based on stale data, not live]" if data_status == "stale_fallback" else ""
+    print(f"PREDICTED AQI FOR TOMORROW: {pred_aqi:.1f}{status_tag}")
 
+    based_on_date = today if data_status != "stale_fallback" else last_live_date
     log_row = {
         "run_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "based_on_date": today.strftime("%Y-%m-%d"),
-        "predicted_aqi_for": (today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        "based_on_date": based_on_date.strftime("%Y-%m-%d"),
+        "predicted_aqi_for": (based_on_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
         "predicted_aqi": round(float(pred_aqi), 1),
+        "data_status": data_status,
     }
     try:
         log_df = pd.read_csv(PREDICTIONS_LOG_PATH)
