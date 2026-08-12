@@ -15,14 +15,16 @@ Bandra). That's fragile - if a station goes permanently offline (as
 Bandra/8678 did in Dec 2021, and as 4 more did simultaneously in June
 2026), a fixed-ID list never recovers.
 
-This version samples several points spread across Mumbai using WAQI's
-/feed/geo:LAT;LON/ endpoint (the same endpoint style as the original
-@uid version, just with coordinates instead of a hardcoded ID). WAQI
-resolves each point to whichever real station is currently nearest and
-reporting, so this self-heals if stations die or new ones appear - no
-code change needed on our end. (An earlier attempt used /map/bounds/
-instead, but that endpoint returned 0 stations for this token/bbox in
-testing, so /feed/ - already proven reliable - is used instead.)
+This version searches WAQI's /search/?keyword=Mumbai endpoint to find
+station names matching "Mumbai" directly - a text match, not a geographic
+one - then fetches each match's own /feed/@uid/ for pollutant data and a
+freshness check. This self-heals if stations die or new ones appear.
+(Two earlier attempts used /map/bounds/ and /feed/geo:lat;lon/ - both
+location-based endpoints - and both returned unusable results for this
+token: /map/bounds/ returned 0 stations, and /feed/geo:/ returned the
+same unrelated Delhi station regardless of the Mumbai coordinates given.
+Keyword search is a different code path and doesn't depend on either
+endpoint working correctly.)
 """
 
 import os
@@ -35,21 +37,10 @@ from tensorflow.keras.models import load_model
 
 TOKEN = os.environ.get("WAQI_TOKEN", "b96baa0045a132d1ea15a9c8b45f0f390bb1d5b6")
 
-# Points spread across Greater Mumbai. Each is used with WAQI's
-# /feed/geo:LAT;LON/ endpoint, which resolves to whichever real station is
-# nearest and currently reporting - so this list doesn't need to match real
-# station locations exactly, it just needs decent geographic spread so we
-# sample different parts of the city instead of repeatedly hitting one area.
-CITY_SAMPLE_POINTS = [
-    ("South Mumbai", 18.9220, 72.8347),
-    ("Bandra", 19.0596, 72.8295),
-    ("Kurla/BKC", 19.0728, 72.8826),
-    ("Andheri", 19.1197, 72.8468),
-    ("Powai", 19.1176, 72.9060),
-    ("Borivali", 19.2307, 72.8567),
-    ("Chembur", 19.0522, 72.9005),
-    ("Navi Mumbai", 19.0330, 73.0297),
-]
+# Keywords used against WAQI's /search/ endpoint to find Mumbai station
+# names. Includes the old British spelling too, in case some station is
+# still labeled that way in WAQI's database.
+SEARCH_KEYWORDS = ["Mumbai", "Bombay"]
 
 MODEL_PATH = "mumbai_aqi_lstm_model_finetuned_recent.keras"
 SCALER_PATH = "mumbai_aqi_scaler.save"
@@ -83,39 +74,59 @@ def _to_valid_number(value):
 
 
 def discover_live_stations():
-    """Find live Mumbai stations by sampling several points spread across the
-    city with WAQI's /feed/geo:LAT;LON/ endpoint - the SAME endpoint style as
-    the original fixed-UID version (/feed/@UID/), just with coordinates
-    instead of a hardcoded ID. WAQI resolves each point to whichever real
-    station is currently nearest and reporting; duplicates are merged.
-
-    This replaces an earlier attempt using /map/bounds/, which returned 0
-    stations for this token/bbox in testing (likely a plan restriction) -
-    /feed/ is the endpoint already proven to work reliably with this token.
-    Returns a list of {"uid", "name", "reading"} dicts.
+    """Find live Mumbai stations via WAQI's keyword search (text match on
+    station name, not geography), then verify each match with its own
+    /feed/@uid/ call for pollutant data and a freshness check. Duplicates
+    across keywords are merged by uid. Returns a list of
+    {"uid", "name", "reading"} dicts.
     """
-    found = {}
-    for label, lat, lon in CITY_SAMPLE_POINTS:
-        url = f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={TOKEN}"
+    matched = {}  # uid -> name, deduped across keywords
+    for kw in SEARCH_KEYWORDS:
+        url = f"https://api.waqi.info/search/?token={TOKEN}&keyword={kw}"
         try:
             resp = requests.get(url, timeout=10)
             data = resp.json()
         except Exception as e:
-            print(f"  {label}: fetch failed - {e}")
+            print(f"  Search for '{kw}' failed: {e}")
             continue
 
-        parsed = _parse_feed_response(data, label)
+        if data.get("status") != "ok":
+            print(f"  Search for '{kw}' failed: {data}")
+            continue
+
+        results = data.get("data", [])
+        print(f"  Search '{kw}': {len(results)} station name match(es).")
+        for entry in results:
+            uid = entry.get("uid")
+            name = (entry.get("station", {}) or {}).get("name", f"uid-{uid}")
+            if uid is None or uid in matched:
+                continue
+            matched[uid] = name
+
+    if not matched:
+        print("  No stations matched Mumbai/Bombay by name search.")
+        return []
+
+    print(f"  {len(matched)} distinct station(s) matched by name - checking freshness of each...")
+
+    live = []
+    for uid, name in matched.items():
+        url = f"https://api.waqi.info/feed/@{uid}/?token={TOKEN}"
+        try:
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+        except Exception as e:
+            print(f"  {name} (uid {uid}): fetch failed - {e}")
+            continue
+
+        parsed = _parse_feed_response(data, f"{name} (uid {uid})")
         if parsed is None:
             continue
-        uid, name, reading = parsed
-        if uid in found:
-            continue  # two sample points resolved to the same nearest station
-        found[uid] = {"uid": uid, "name": name, "reading": reading}
-        print(f"  {label} -> nearest live station: {name} (uid {uid})")
+        parsed_uid, parsed_name, reading = parsed
+        live.append({"uid": parsed_uid, "name": parsed_name, "reading": reading})
 
-    print(f"  Discovery: sampled {len(CITY_SAMPLE_POINTS)} points across Mumbai, "
-          f"found {len(found)} distinct live station(s).")
-    return list(found.values())
+    print(f"  Discovery: {len(live)} of {len(matched)} name-matched stations are live and fresh.")
+    return live
 
 
 def _parse_feed_response(data, source_label):
