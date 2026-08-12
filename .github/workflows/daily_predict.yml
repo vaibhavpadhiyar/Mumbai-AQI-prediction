@@ -1,31 +1,27 @@
 name: Daily AQI Prediction
-
 on:
   schedule:
     # Runs at 03:30 UTC = 09:00 IST, every day
     - cron: "30 3 * * *"
   workflow_dispatch:  # also lets you trigger it manually from the GitHub UI
-
 jobs:
   predict:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install requests joblib tensorflow pandas numpy scikit-learn
-
       - name: Run prediction
         env:
           WAQI_TOKEN: ${{ secrets.WAQI_TOKEN }}
+          OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
+          CPCB_API_KEY: ${{ secrets.CPCB_API_KEY }}
         run: python predict_once.py
-
       - name: Commit updated data files back to repo
         run: |
           git config --global user.name "github-actions[bot]"
