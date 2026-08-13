@@ -1,2 +1,2 @@
 station,uid,PM2.5,PM10,NO2,SO2,O3,AQI,source
-"OpenWeatherMap (Mumbai, modeled)",owm-mumbai-center,30.0,9.4,0.1,0.1,15.5,30.0,openweathermap
+"OpenWeatherMap (Mumbai, modeled)",owm-mumbai-center,24.5,9.1,0.0,0.1,15.9,24.5,openweathermap
