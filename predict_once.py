@@ -22,12 +22,14 @@ Rather than depend on one upstream source, this version tries THREE
 independent sources in order and uses the first that returns usable data:
 
   1. WAQI (keyword search, see below) - kept first in case it recovers.
-  2. OpenWeatherMap Air Pollution API - coordinate-based modeled reading,
-     not tied to any single physical sensor that can individually die.
-     Requires OWM_API_KEY (free tier, instant signup).
-  3. CPCB via data.gov.in - India's own official real-time monitoring
+  2. CPCB via data.gov.in - India's own official real-time monitoring
      network, the same one WAQI itself is supposed to ingest from.
-     Requires CPCB_API_KEY (free, data.gov.in registration).
+     Requires CPCB_API_KEY (free, data.gov.in registration). Prioritized
+     over OpenWeatherMap since it's ground-truth government data.
+  3. OpenWeatherMap Air Pollution API - coordinate-based modeled reading,
+     not tied to any single physical sensor that can individually die.
+     Requires OWM_API_KEY (free tier, instant signup). Used last since
+     it's a modeled estimate rather than a direct measurement.
 
 Only if ALL THREE come back empty does the script fall back to reusing
 the model's last known-good window (see main()), clearly flagged as
@@ -58,8 +60,8 @@ from datetime import datetime
 from tensorflow.keras.models import load_model
 
 TOKEN = os.environ.get("WAQI_TOKEN", "b96baa0045a132d1ea15a9c8b45f0f390bb1d5b6")
-OWM_API_KEY = os.environ.get("OWM_API_KEY", "d5a6daf3c5b2019f84d1b5c29410cfff")
-CPCB_API_KEY = os.environ.get("CPCB_API_KEY", "579b464db66ec23bdd000001fca7b966877041b64eb07cfad46ab07c")
+OWM_API_KEY = os.environ.get("OWM_API_KEY", "")
+CPCB_API_KEY = os.environ.get("CPCB_API_KEY", "")
 
 # Keywords used against WAQI's /search/ endpoint to find Mumbai station
 # names. Includes the old British spelling too, in case some station is
@@ -402,33 +404,39 @@ def fetch_cpcb_readings():
 
 def discover_live_readings():
     """Try each live source in order, use the first that returns enough
-    usable data. WAQI and CPCB need >=MIN_LIVE_STATIONS distinct stations
-    (to average out single-sensor noise); OpenWeatherMap's single modeled
-    citywide reading is accepted alone since it isn't a physical sensor
-    that can individually misbehave the same way.
+    usable data. Order: WAQI -> CPCB -> OpenWeatherMap. CPCB is prioritized
+    over OpenWeatherMap because it's India's own official government
+    monitoring network (ground-truth measurements), whereas OpenWeatherMap
+    is a modeled/interpolated estimate - CPCB is the better source when
+    both are available, even though OWM's coordinate-based reading is
+    structurally more failure-resistant (no single sensor to go offline).
+    WAQI and CPCB need >=MIN_LIVE_STATIONS distinct stations (to average
+    out single-sensor noise); OpenWeatherMap's single modeled citywide
+    reading is accepted alone since it isn't a physical sensor that can
+    individually misbehave the same way.
     Returns (source_name, list of {"uid","name","reading"}).
     """
     print("Trying WAQI first...")
     waqi = discover_live_stations()
     if len(waqi) >= MIN_LIVE_STATIONS:
         return "waqi", waqi
-    print(f"  WAQI: only {len(waqi)} usable station(s) - trying OpenWeatherMap next.")
-
-    owm = fetch_openweathermap_reading()
-    if len(owm) >= 1:
-        return "openweathermap", owm
-    print("  OpenWeatherMap: unavailable - trying CPCB next.")
+    print(f"  WAQI: only {len(waqi)} usable station(s) - trying CPCB next.")
 
     cpcb = fetch_cpcb_readings()
     if len(cpcb) >= MIN_LIVE_STATIONS:
         return "cpcb", cpcb
-    print(f"  CPCB: only {len(cpcb)} usable station(s) either - no live source available today.")
+    print(f"  CPCB: only {len(cpcb)} usable station(s) - trying OpenWeatherMap next.")
+
+    owm = fetch_openweathermap_reading()
+    if len(owm) >= 1:
+        return "openweathermap", owm
+    print("  OpenWeatherMap: unavailable either - no live source available today.")
 
     return "none", []
 
 
 def fetch_today_city_average():
-    print("Discovering live air quality data for Mumbai (WAQI -> OpenWeatherMap -> CPCB)...")
+    print("Discovering live air quality data for Mumbai (WAQI -> CPCB -> OpenWeatherMap)...")
     source, candidates = discover_live_readings()
     if not candidates:
         print("  No live source returned usable data today.")
