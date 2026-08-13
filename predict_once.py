@@ -337,9 +337,11 @@ def fetch_cpcb_readings():
     data.gov.in - the same government network WAQI is itself supposed to
     ingest from. NOTE: this dataset's pollutant values are documented as
     already being on the 0-500 AQI index scale (not raw concentrations),
-    so no breakpoint conversion is applied here - verify this against a
-    real response from your own API key, since this integration hasn't
-    been run against a live key yet.
+    so no breakpoint conversion is applied here.
+
+    data.gov.in's infrastructure is known to be slow/flaky, so this uses a
+    longer timeout and one retry before giving up, rather than failing on
+    the first hiccup.
     """
     if not CPCB_API_KEY:
         print("  CPCB: CPCB_API_KEY not set - skipping this source.")
@@ -349,12 +351,17 @@ def fetch_cpcb_readings():
         f"https://api.data.gov.in/resource/{CPCB_RESOURCE_ID}"
         f"?api-key={CPCB_API_KEY}&format=json&filters[city]=Mumbai&limit=200"
     )
-    try:
-        resp = requests.get(url, timeout=15)
-        data = resp.json()
-    except Exception as e:
-        print(f"  CPCB: fetch failed - {e}")
-        return []
+
+    data = None
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(url, timeout=30)
+            data = resp.json()
+            break
+        except Exception as e:
+            print(f"  CPCB: fetch attempt {attempt} failed - {e}")
+            if attempt == 2:
+                return []
 
     records = data.get("records", [])
     if not records:
