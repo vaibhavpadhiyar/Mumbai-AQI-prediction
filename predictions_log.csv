@@ -32,3 +32,4 @@ run_timestamp,based_on_date,predicted_aqi_for,predicted_aqi,data_status
 2026-08-29 10:18:37,2026-08-29,2026-08-30,52.5,live_openweathermap
 2026-08-30 09:24:08,2026-08-30,2026-08-31,51.8,live_openweathermap
 2026-08-31 09:59:07,2026-08-31,2026-09-01,50.9,live_openweathermap
+2026-09-01 08:50:19,2026-09-01,2026-09-02,50.6,live_openweathermap
