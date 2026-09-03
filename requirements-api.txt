@@ -1,0 +1,4 @@
+# Add these to your existing backend environment (which already has
+# tensorflow, pandas, joblib, etc. for the LSTM pipeline).
+fastapi>=0.111
+uvicorn[standard]>=0.30

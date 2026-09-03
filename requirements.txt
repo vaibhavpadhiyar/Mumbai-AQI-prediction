@@ -1,3 +1,11 @@
-streamlit
 pandas
-plotly
+numpy
+tensorflow
+joblib
+requests
+python-dotenv
+scikit-learn
+
+# Only needed if you run backend/api.py locally or deploy it:
+fastapi
+uvicorn[standard]

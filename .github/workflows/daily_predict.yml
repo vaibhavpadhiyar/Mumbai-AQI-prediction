@@ -15,17 +15,17 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install requests joblib tensorflow pandas numpy scikit-learn
+        run: pip install requests joblib tensorflow pandas numpy scikit-learn python-dotenv
       - name: Run prediction
         env:
           WAQI_TOKEN: ${{ secrets.WAQI_TOKEN }}
           OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
           CPCB_API_KEY: ${{ secrets.CPCB_API_KEY }}
-        run: python predict_once.py
-      - name: Commit updated data files back to repo
+        run: python -m services.predict_once
+      - name: Commit updated data back to repo
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add buffer.csv predictions_log.csv latest_stations.csv history_full.csv
+          git add data/live_history.csv
           git diff --quiet && git diff --staged --quiet || git commit -m "Daily AQI prediction update"
           git push
